@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 // MARK: - Ribbon
 
@@ -20,6 +21,8 @@ struct RibbonView: View {
                 StickersGroup()
                 sep
                 ShapesGroup()
+                sep
+                StylesGroup()
                 sep
                 ColorGroup()
                 sep
@@ -199,7 +202,7 @@ struct ToolsGroup: View {
                 GridRow {
                     toolBtn("Eraser", "eraser", .eraser)
                     toolBtn("Color picker", "eyedropper", .picker)
-                    toolBtn("Magnifier", "magnifyingglass", .magnifier)
+                    toolBtn("Move layer", "arrow.up.and.down.and.arrow.left.and.right", .move)
                 }
             }
         }
@@ -286,7 +289,6 @@ struct StickersGroup: View {
 
 struct ShapesGroup: View {
     @EnvironmentObject var model: PaintModel
-    @EnvironmentObject var ui: UIState
     @State private var scrollOffset = 0
 
     var body: some View {
@@ -322,36 +324,107 @@ struct ShapesGroup: View {
                         }
                     }
                 }
-                VStack(alignment: .leading, spacing: 2) {
-                    dropButton(id: "outline-dd", tip: "Shape outline", symbol: "square", menu: styleMenu(outline: true))
-                    dropButton(id: "fill-dd", tip: "Shape fill", symbol: "square.inset.filled", menu: styleMenu(outline: false))
-                }
+            }
+        }
+    }
+}
+
+// MARK: - Styles
+
+struct StylesGroup: View {
+    @EnvironmentObject var model: PaintModel
+    @EnvironmentObject var ui: UIState
+
+    var body: some View {
+        RibbonGroup(label: "Styles") {
+            VStack(alignment: .leading, spacing: 2) {
+                dropButton(id: "shape-outline-dd", tip: "Shape outline", symbol: "square", menu: outlineMenu())
+                dropButton(id: "shape-fill-dd", tip: "Shape fill", symbol: "square.inset.filled", menu: fillMenu())
+                dropButton(id: "shape-width-dd", tip: "Outline width", symbol: "line.3.horizontal", menu: widthMenu())
             }
         }
     }
 
     private func dropButton(id: String, tip: String, symbol: String, menu: [MenuItem]) -> some View {
-        HoverButton(tip: tip, height: 26, action: { ui.openMenu(menu, anchorId: id) }) {
+        HoverButton(tip: tip, height: 18, action: { ui.openMenu(menu, anchorId: id) }) {
             HStack(spacing: 4) {
-                Image(systemName: symbol).font(.system(size: 13))
-                Image(systemName: "chevron.down").font(.system(size: 7, weight: .semibold)).foregroundStyle(Theme.textSecondary)
+                Image(systemName: symbol).font(.system(size: 11))
+                Text(labelText(id: id))
+                    .font(.system(size: 11))
+                    .foregroundStyle(Theme.textSecondary)
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 7, weight: .semibold))
+                    .foregroundStyle(Theme.textSecondary)
             }
             .padding(.horizontal, 4)
         }
         .reportFrame(id)
     }
 
-    private func styleMenu(outline: Bool) -> [MenuItem] {
-        FillStyle.allCases.map { s in
+    private func labelText(id: String) -> String {
+        switch id {
+        case "shape-outline-dd":
+            return model.outlineStyle == .none ? "No outline" : "Outline"
+        case "shape-fill-dd":
+            return model.fillStyle == .none ? "No fill" : "Fill"
+        default:
+            return "\(Int(model.sizes["shape"] ?? 3)) px"
+        }
+    }
+
+    private func outlineMenu() -> [MenuItem] {
+        OutlineStyle.allCases.map { s in
             MenuItem(
-                icon: s == .none ? "slash.circle" : "square.fill",
-                label: s.displayName(outline: outline),
-                checked: (outline ? model.outlineStyle : model.fillStyle) == s,
-                action: {
-                    if outline { model.outlineStyle = s } else { model.fillStyle = s }
-                }
+                icon: s == .none ? "slash.circle" : "square",
+                label: s.displayName(),
+                checked: model.outlineStyle == s,
+                action: { model.outlineStyle = s }
             )
         }
+    }
+
+    private func fillMenu() -> [MenuItem] {
+        FillPattern.allCases.map { s in
+            MenuItem(
+                icon: icon(for: s),
+                label: s.displayName(),
+                checked: model.fillStyle == s,
+                action: { model.fillStyle = s }
+            )
+        }
+    }
+
+    private func icon(for fill: FillPattern) -> String {
+        switch fill {
+        case .none: return "slash.circle"
+        case .solid: return "square.fill"
+        case .pct12, .pct25, .pct50, .pct75: return "square.dotted"
+        case .horizontal: return "line.3.horizontal"
+        case .vertical: return "line.3.horizontal.decrease"
+        case .cross: return "plus"
+        case .diagDown: return "arrow.down.forward"
+        case .diagUp: return "arrow.up.forward"
+        case .diagCross: return "xmark"
+        }
+    }
+
+    private func widthMenu() -> [MenuItem] {
+        let widths: [CGFloat] = [1, 2, 3, 5, 8, 12]
+        return widths.map { w in
+            MenuItem(
+                iconView: AnyView(widthPreview(w)),
+                label: "\(Int(w)) px",
+                checked: abs((model.sizes["shape"] ?? 3) - w) < 0.01,
+                action: { model.sizes["shape"] = w }
+            )
+        }
+    }
+
+    private func widthPreview(_ width: CGFloat) -> some View {
+        Capsule()
+            .fill(model.color1.color)
+            .frame(width: 18, height: max(1, width))
+            .overlay(Capsule().stroke(Color.white.opacity(0.18), lineWidth: 0.5))
     }
 }
 
@@ -399,13 +472,8 @@ struct ColorGroup: View {
     var body: some View {
         RibbonGroup(label: "Color") {
             HStack(spacing: 10) {
-                // wells
-                ZStack(alignment: .topLeading) {
-                    well(2)
-                        .offset(x: 20, y: 22)
-                    well(1)
-                }
-                .frame(width: 48, height: 50)
+                FillOutlineWell(fillColor: model.color2.color, outlineColor: model.color1.color)
+                    .help("Fill and outline colors")
 
                 // palette
                 VStack(spacing: 3) {
@@ -431,30 +499,6 @@ struct ColorGroup: View {
                 .help("Edit colors")
             }
         }
-    }
-
-    private func well(_ n: Int) -> some View {
-        let color = n == 1 ? model.color1 : model.color2
-        let selected = model.activeWell == n
-        let outer: CGFloat = n == 1 ? 34 : 26
-        let inner: CGFloat = n == 1 ? 26 : 20
-        return Button {
-            model.activeWell = n
-        } label: {
-            ZStack {
-                Circle()
-                    .stroke(selected ? Theme.accent : .clear, lineWidth: 2)
-                    .frame(width: outer, height: outer)
-                Circle()
-                    .fill(color.color)
-                    .overlay(Circle().stroke(Color.white.opacity(0.25), lineWidth: 1))
-                    .frame(width: inner, height: inner)
-            }
-            .frame(width: outer, height: outer)
-            .contentShape(Circle())
-        }
-        .buttonStyle(.plain)
-        .help(n == 1 ? "Foreground color" : "Background color")
     }
 
     private func paletteGrid<S: Sequence>(_ colors: S) -> some View where S.Element == String {
@@ -486,6 +530,28 @@ struct ColorGroup: View {
     }
 }
 
+struct FillOutlineWell: View {
+    let fillColor: Color
+    let outlineColor: Color
+
+    var body: some View {
+        ZStack(alignment: .topLeading) {
+            Circle()
+                .stroke(outlineColor, lineWidth: 3)
+                .background(Circle().fill(Color.clear))
+                .frame(width: 32, height: 32)
+                // .offset(x: 2, y: 2)
+
+            Circle()
+                .fill(fillColor)
+                .overlay(Circle().stroke(Color.white.opacity(0.25), lineWidth: 1))
+                .frame(width: 28, height: 28)
+                .offset(x: 2, y: 2)
+        }
+        .frame(width: 36, height: 36)
+    }
+}
+
 struct SwatchButton: View {
     @EnvironmentObject var model: PaintModel
     let rgb: RGB
@@ -493,26 +559,74 @@ struct SwatchButton: View {
     @State private var hovered = false
 
     var body: some View {
-        Button {
-            model.setColor(well: model.activeWell, rgb)
-        } label: {
-            Circle()
-                .fill(rgb.color)
-                .overlay(Circle().stroke(Color.white.opacity(0.16), lineWidth: 1))
-                .overlay(
-                    Circle().stroke(isSelected ? Theme.accent : .clear, lineWidth: 2).padding(-2)
+        Circle()
+            .fill(rgb.color)
+            .overlay(Circle().stroke(Color.white.opacity(0.16), lineWidth: 1))
+            .overlay(
+                Circle().stroke(isFillSelected ? Theme.accent : .clear, lineWidth: 2).padding(-2)
+            )
+            .overlay(
+                Circle().stroke(isOutlineSelected ? Color.white : .clear, lineWidth: 1.5).padding(-4)
+            )
+            .frame(width: 15, height: 15)
+            .scaleEffect(hovered ? 1.15 : 1)
+            .contentShape(Circle())
+            .overlay {
+                LeftRightClickCatcher(
+                    onLeftClick: {
+                        model.activeWell = 2
+                        model.setColor(well: 2, rgb)
+                    },
+                    onRightClick: {
+                        model.activeWell = 1
+                        model.setColor(well: 1, rgb)
+                    }
                 )
-                .frame(width: 15, height: 15)
-                .scaleEffect(hovered ? 1.15 : 1)
-                .contentShape(Circle())
-        }
-        .buttonStyle(.plain)
+            }
         .onHover { hovered = $0 }
         .help(name)
     }
 
-    private var isSelected: Bool {
-        (model.activeWell == 1 ? model.color1 : model.color2) == rgb
+    private var isFillSelected: Bool {
+        model.color2 == rgb
+    }
+
+    private var isOutlineSelected: Bool {
+        model.color1 == rgb
+    }
+}
+
+struct LeftRightClickCatcher: NSViewRepresentable {
+    var onLeftClick: () -> Void
+    var onRightClick: () -> Void
+
+    final class ClickView: NSView {
+        var onLeftClick: (() -> Void)?
+        var onRightClick: (() -> Void)?
+
+        override func mouseDown(with event: NSEvent) {
+            if event.modifierFlags.contains(.control) {
+                onRightClick?()
+            } else {
+                onLeftClick?()
+            }
+        }
+
+        override func rightMouseDown(with event: NSEvent) {
+            onRightClick?()
+        }
+    }
+
+    func makeNSView(context: Context) -> ClickView {
+        let v = ClickView()
+        v.onLeftClick = onLeftClick
+        v.onRightClick = onRightClick
+        return v
+    }
+
+    func updateNSView(_ nsView: ClickView, context: Context) {
+        nsView.onLeftClick = onLeftClick
+        nsView.onRightClick = onRightClick
     }
 }
 

@@ -79,6 +79,18 @@ enum BrushEngine {
         ctx.setAlpha(1)
     }
 
+    static func spraySegment(_ ctx: CGContext, from a: CGPoint, to b: CGPoint, size: CGFloat, color: RGB) {
+        let dx = b.x - a.x
+        let dy = b.y - a.y
+        let dist = max(1, hypot(dx, dy))
+        let spacing = max(1.5, size * 0.2)
+        let steps = Int(ceil(dist / spacing))
+        for i in 0...steps {
+            let t = CGFloat(i) / CGFloat(max(1, steps))
+            sprayAt(ctx, CGPoint(x: a.x + dx * t, y: a.y + dy * t), size: size, color: color)
+        }
+    }
+
     private static func oilSegment(_ ctx: CGContext, _ a: CGPoint, _ b: CGPoint, size: CGFloat, color: RGB) {
         lineSegment(ctx, a, b, width: max(1, size), color: color)
         ctx.saveGState()

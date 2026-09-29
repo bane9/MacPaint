@@ -6,7 +6,7 @@ import UniformTypeIdentifiers
 // MARK: - Enums
 
 enum Tool: String {
-    case select, pencil, fill, text, eraser, picker, magnifier, brush, shape, sticker
+    case select, pencil, fill, text, eraser, picker, magnifier, move, brush, shape, sticker
 }
 
 enum BrushType: String, CaseIterable, Identifiable {
@@ -37,31 +37,48 @@ enum BrushType: String, CaseIterable, Identifiable {
     }
 }
 
-enum FillStyle: String, CaseIterable, Identifiable {
-    case none, solid, crayon, marker, oil, pencil, watercolour
+enum FillPattern: String, CaseIterable, Identifiable {
+    case none
+    case solid
+    case pct12
+    case pct25
+    case pct50
+    case pct75
+    case horizontal
+    case vertical
+    case cross
+    case diagDown
+    case diagUp
+    case diagCross
     var id: String { rawValue }
 
-    var alpha: CGFloat {
+    func displayName() -> String {
         switch self {
-        case .none: return 0
-        case .solid: return 1
-        case .crayon: return 0.7
-        case .marker: return 0.55
-        case .oil: return 0.9
-        case .pencil: return 0.75
-        case .watercolour: return 0.35
+        case .none: return "No fill"
+        case .solid: return "Solid color"
+        case .pct12: return "12.5% halftone"
+        case .pct25: return "25% halftone"
+        case .pct50: return "50% halftone"
+        case .pct75: return "75% halftone"
+        case .horizontal: return "Horizontal hatch"
+        case .vertical: return "Vertical hatch"
+        case .cross: return "Cross hatch"
+        case .diagDown: return "Diagonal \\"
+        case .diagUp: return "Diagonal /"
+        case .diagCross: return "Diagonal cross"
         }
     }
+}
 
-    func displayName(outline: Bool) -> String {
+enum OutlineStyle: String, CaseIterable, Identifiable {
+    case none
+    case solid
+    var id: String { rawValue }
+
+    func displayName() -> String {
         switch self {
-        case .none: return outline ? "No outline" : "No fill"
+        case .none: return "No outline"
         case .solid: return "Solid color"
-        case .crayon: return "Crayon"
-        case .marker: return "Marker"
-        case .oil: return "Oil"
-        case .pencil: return "Natural pencil"
-        case .watercolour: return "Watercolour"
         }
     }
 }
@@ -180,7 +197,9 @@ private struct Snapshot {
 final class PaintModel: ObservableObject {
     static let defaultWidth = 800
     static let defaultHeight = 512
-    static let zoomLevels: [CGFloat] = [0.125, 0.25, 0.5, 1, 2, 3, 4, 5, 6, 7, 8]
+    static let minZoom: CGFloat = 0.01
+    static let maxZoom: CGFloat = 4
+    static let zoomLevels: [CGFloat] = [0.01, 0.02, 0.05, 0.1, 0.125, 0.2, 0.25, 0.33, 0.5, 0.67, 0.75, 1, 1.25, 1.5, 2, 3, 4]
 
     // document
     private(set) var layers: [Layer] = []
@@ -195,8 +214,8 @@ final class PaintModel: ObservableObject {
     @Published var shapeId: String = "rectangle"
     @Published var selectMode: SelectMode = .rect
     @Published var transparentSelection = false
-    @Published var outlineStyle: FillStyle = .solid
-    @Published var fillStyle: FillStyle = .none
+    @Published var outlineStyle: OutlineStyle = .solid
+    @Published var fillStyle: FillPattern = .none
     @Published var color1: RGB = .black
     @Published var color2: RGB = .white
     @Published var activeWell = 1
@@ -454,7 +473,7 @@ final class PaintModel: ObservableObject {
 
     func setTool(_ t: Tool) {
         guard tool != t else { return }
-        if selection != nil && t != .select && t != .magnifier && t != .picker {
+        if selection != nil && t != .select && t != .magnifier && t != .picker && t != .move {
             dropSelection(commit: true)
         }
         previousTool = tool
@@ -482,7 +501,7 @@ final class PaintModel: ObservableObject {
     // MARK: zoom
 
     func setZoom(_ z: CGFloat, focusDocPoint: CGPoint? = nil) {
-        let clamped = min(8, max(0.125, z))
+        let clamped = min(Self.maxZoom, max(Self.minZoom, z))
         guard clamped != zoom else { return }
         zoomFocusRequest?(focusDocPoint)
         zoom = clamped
@@ -963,6 +982,11 @@ final class PaintModel: ObservableObject {
     }
 
     // MARK: file I/O
+
+    func canOpenImage(from url: URL) -> Bool {
+        guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else { return false }
+        return CGImageSourceCreateImageAtIndex(src, 0, nil) != nil
+    }
 
     func openImage(from url: URL) {
         guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),

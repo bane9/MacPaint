@@ -369,10 +369,10 @@ struct ZoomSlider: View {
     var body: some View {
         FluentSlider(
             value: Binding(
-                get: { Double(model.nearestZoomIndex()) },
-                set: { model.setZoom(PaintModel.zoomLevels[Int($0.rounded())]) }
+                get: { Double((model.zoom * 100).rounded()) },
+                set: { model.setZoom(CGFloat($0) / 100) }
             ),
-            range: 0...Double(PaintModel.zoomLevels.count - 1),
+            range: Double(PaintModel.minZoom * 100)...Double(PaintModel.maxZoom * 100),
             step: 1
         )
     }

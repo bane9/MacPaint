@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import UniformTypeIdentifiers
 
 @main
 struct PaintApp: App {
@@ -16,6 +17,13 @@ struct PaintApp: App {
                 .onAppear {
                     KeyboardHandler.install(model: model, ui: ui)
                     DemoMode.run(model: model, ui: ui)
+                    AppDelegate.openURLHandler = { url in
+                        guard model.canOpenImage(from: url) else { return }
+                        ui.confirmUnsaved(model: model) {
+                            model.openImage(from: url)
+                        }
+                    }
+                    AppDelegate.flushPendingOpenURLs()
                     let m = model, u = ui
                     AppDelegate.terminateGuard = {
                         guard m.dirty else { return true }
@@ -141,6 +149,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Returns true when it is safe to terminate; otherwise it shows the
     /// unsaved-changes dialog itself. Installed from ContentView.
     static var terminateGuard: (() -> Bool)?
+    static var openURLHandler: ((URL) -> Void)?
+    private static var pendingOpenURLs: [URL] = []
+
+    static func requestOpenURL(_ url: URL) {
+        if let handler = openURLHandler {
+            handler(url)
+        } else {
+            pendingOpenURLs.append(url)
+        }
+    }
+
+    static func flushPendingOpenURLs() {
+        guard let handler = openURLHandler else { return }
+        let queued = pendingOpenURLs
+        pendingOpenURLs.removeAll()
+        for url in queued {
+            handler(url)
+        }
+    }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         if let allow = AppDelegate.terminateGuard, !allow() {
@@ -150,6 +177,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        NSWindow.allowsAutomaticWindowTabbing = false
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
 
@@ -193,6 +221,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         true
     }
+
+    func application(_ sender: NSApplication, openFile filename: String) -> Bool {
+        let url = URL(fileURLWithPath: filename)
+        AppDelegate.requestOpenURL(url)
+        return true
+    }
+
+    func application(_ application: NSApplication, open urls: [URL]) {
+        for url in urls {
+            AppDelegate.requestOpenURL(url)
+        }
+    }
+
+    func application(_ sender: NSApplication, openFiles filenames: [String]) {
+        for file in filenames {
+            AppDelegate.requestOpenURL(URL(fileURLWithPath: file))
+        }
+    }
 }
 
 // MARK: - Content view
@@ -234,7 +280,28 @@ struct ContentView: View {
             ToastLayer()
         }
         .background(WindowConfigurator(model: model, ui: ui))
-        .ignoresSafeArea()
+        .onDrop(of: [UTType.fileURL.identifier], isTargeted: nil) { providers in
+            let accepted = providers.contains { $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) }
+            for provider in providers where provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
+                provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
+                    let data = item as? Data
+                    let str = item as? String
+                    let url: URL?
+                    if let data, let s = String(data: data, encoding: .utf8) {
+                        url = URL(string: s)
+                    } else if let str {
+                        url = URL(string: str)
+                    } else {
+                        url = item as? URL
+                    }
+                    guard let fileURL = url?.standardizedFileURL else { return }
+                    Task { @MainActor in
+                        AppDelegate.requestOpenURL(fileURL)
+                    }
+                }
+            }
+            return accepted
+        }
         .environment(\.colorScheme, .dark)
     }
 }

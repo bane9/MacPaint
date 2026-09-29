@@ -11,7 +11,7 @@ enum CanvasHolder {
 // MARK: - Interaction state
 
 private enum DragMode: Equatable {
-    case stroke, erase, line, shape, curve
+    case stroke, erase, line, shape, curve, textBox, layerMove
     case selRect, selFree, selMove, selScale
     case polyFirst
     case canvasResize(String) // "e" | "s" | "se"
@@ -30,6 +30,8 @@ private struct DragState {
     var selHandle = -1
     var selOrig = CGRect.zero
     var moveOffset = CGPoint.zero
+    var layerMoveBase: CGImage?
+    var layerMoveDelta = CGPoint.zero
     var resizeStartSize = CGSize.zero
     var resizeNewSize = CGSize.zero
 }
@@ -63,6 +65,7 @@ final class DocumentNSView: NSView {
     // text tool
     private var textView: PaintTextView?
     private var textOrigin: CGPoint = .zero // doc coords
+    private var textBoxSizeDoc: CGSize?
 
     override var isFlipped: Bool { true }
     override var acceptsFirstResponder: Bool { true }
@@ -109,6 +112,12 @@ final class DocumentNSView: NSView {
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in self?.styleTextView() }
             .store(in: &cancellables)
+        model.$rulersOn
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.needsDisplay = true
+            }
+            .store(in: &cancellables)
 
         model.zoomFocusRequest = { [weak self] docPt in
             self?.recordZoomFocus(docPt)
@@ -122,6 +131,9 @@ final class DocumentNSView: NSView {
                     self.needsDisplay = true
                 }
             }
+        }
+        if let antsTimer {
+            RunLoop.main.add(antsTimer, forMode: .common)
         }
 
         let tracking = NSTrackingArea(
@@ -208,8 +220,8 @@ final class DocumentNSView: NSView {
     func fitToWindow() {
         guard let m = model, let scroll = enclosingScrollView else { return }
         let clip = scroll.contentView.bounds.size
-        let z = min((clip.width - 100) / CGFloat(m.docWidth), (clip.height - 80) / CGFloat(m.docHeight), 8)
-        m.setZoom(max(0.125, z))
+        let z = min((clip.width - 100) / CGFloat(m.docWidth), (clip.height - 80) / CGFloat(m.docHeight), PaintModel.maxZoom)
+        m.setZoom(max(PaintModel.minZoom, z))
     }
 
     // MARK: drawing
@@ -240,12 +252,33 @@ final class DocumentNSView: NSView {
         g.scaleBy(x: zoom, y: zoom)
         g.interpolationQuality = zoom > 1 ? .none : .high
 
-        for layer in m.layers where layer.visible {
+        let moveDrag = (drag?.mode == .layerMove) ? drag : nil
+        for (idx, layer) in m.layers.enumerated() where layer.visible {
+            if let d = moveDrag, idx == m.activeLayerIndex, let img = d.layerMoveBase {
+                g.saveGState()
+                g.setAlpha(layer.opacity)
+                drawImageTopLeft(
+                    g,
+                    img,
+                    in: CGRect(
+                        x: d.layerMoveDelta.x,
+                        y: d.layerMoveDelta.y,
+                        width: CGFloat(m.docWidth),
+                        height: CGFloat(m.docHeight)
+                    )
+                )
+                g.restoreGState()
+                continue
+            }
             guard let img = layer.image() else { continue }
             g.saveGState()
             g.setAlpha(layer.opacity)
             drawImageTopLeft(g, img, in: CGRect(x: 0, y: 0, width: m.docWidth, height: m.docHeight))
             g.restoreGState()
+        }
+
+        if m.rulersOn {
+            drawRulerGuides(g, m)
         }
 
         // live stroke preview
@@ -294,6 +327,10 @@ final class DocumentNSView: NSView {
                 if let end = d.end {
                     strokeAndFillPath(g, m, linePath(from: d.start, to: end, shift: d.shiftDown), isOpen: true, right: d.rightButton)
                 }
+            case .textBox:
+                if let r = d.rect {
+                    drawMarquee(g, rect: r)
+                }
             case .shape:
                 if let r = d.rect {
                     let shape = ShapeLibrary.byId(m.shapeId)
@@ -310,6 +347,9 @@ final class DocumentNSView: NSView {
             default: break
             }
         }
+        if m.tool == .sticker, drag == nil {
+            drawStickerGhost(g, m)
+        }
         if let st = curveState {
             strokeAndFillPath(g, m, curvePath(st), isOpen: true, right: st.right)
         }
@@ -321,6 +361,25 @@ final class DocumentNSView: NSView {
         }
     }
 
+    private func drawStickerGhost(_ g: CGContext, _ m: PaintModel) {
+        guard let raw = hoverDoc else { return }
+        guard raw.x >= 0, raw.y >= 0, raw.x <= CGFloat(m.docWidth), raw.y <= CGFloat(m.docHeight) else { return }
+
+        let p = clampDoc(raw)
+        let attrs: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 64)]
+        let attr = NSAttributedString(string: m.stickerChar, attributes: attrs)
+        let size = attr.size()
+
+        g.saveGState()
+        g.setAlpha(0.45)
+        let ns = NSGraphicsContext(cgContext: g, flipped: true)
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = ns
+        attr.draw(at: NSPoint(x: p.x - size.width / 2, y: p.y - size.height / 2))
+        NSGraphicsContext.restoreGraphicsState()
+        g.restoreGState()
+    }
+
     func strokeAndFillPath(_ g: CGContext, _ m: PaintModel, _ path: CGPath, isOpen: Bool, right: Bool) {
         let strokeCol = right ? m.color2 : m.color1
         let fillCol = right ? m.color1 : m.color2
@@ -328,15 +387,97 @@ final class DocumentNSView: NSView {
         g.setLineJoin(.round)
         g.setLineCap(.round)
         if !isOpen && m.fillStyle != .none {
-            g.setAlpha(m.fillStyle.alpha)
-            g.setFillColor(fillCol.cgColor)
-            g.addPath(path)
-            g.fillPath()
+            paintFill(g, path: path, style: m.fillStyle, color: fillCol)
         }
         if m.outlineStyle != .none {
-            g.setAlpha(m.outlineStyle.alpha)
-            g.setStrokeColor(strokeCol.cgColor)
-            g.setLineWidth(m.sizes["shape"] ?? 3)
+            paintStroke(g, path: path, style: m.outlineStyle, width: m.sizes["shape"] ?? 3, color: strokeCol)
+        }
+        g.restoreGState()
+    }
+
+    private func paintFill(_ g: CGContext, path: CGPath, style: FillPattern, color: RGB) {
+        g.saveGState()
+        switch style {
+        case .none:
+            break
+        case .solid:
+            g.setAlpha(1)
+            g.setFillColor(color.cgColor)
+            g.addPath(path)
+            g.fillPath()
+        default:
+            fillPathWithHalftone(g, path: path, style: style, color: color)
+        }
+        g.restoreGState()
+    }
+
+    private func fillPathWithHalftone(_ g: CGContext, path: CGPath, style: FillPattern, color: RGB) {
+        guard let pattern = halftonePattern(style) else { return }
+        g.saveGState()
+        g.addPath(path)
+        g.clip()
+        g.setFillColor(color.cgColor)
+        let box = path.boundingBoxOfPath.integral.insetBy(dx: -1, dy: -1)
+        let minX = Int(floor(box.minX))
+        let maxX = Int(ceil(box.maxX))
+        let minY = Int(floor(box.minY))
+        let maxY = Int(ceil(box.maxY))
+        for y in minY...maxY {
+            for x in minX...maxX {
+                if pattern[y & 7][x & 7] {
+                    g.fill(CGRect(x: CGFloat(x), y: CGFloat(y), width: 1, height: 1))
+                }
+            }
+        }
+        g.restoreGState()
+    }
+
+    private func halftonePattern(_ style: FillPattern) -> [[Bool]]? {
+        switch style {
+        case .none, .solid:
+            return nil
+        case .pct12:
+            return patternFromRule { x, y in x % 4 == 0 && y % 4 == 0 }
+        case .pct25:
+            return patternFromRule { x, y in (x % 2 == 0) && (y % 2 == 0) }
+        case .pct50:
+            return patternFromRule { x, y in (x + y) % 2 == 0 }
+        case .pct75:
+            return patternFromRule { x, y in !((x % 2 == 1) && (y % 2 == 1)) }
+        case .horizontal:
+            return patternFromRule { _, y in y % 2 == 0 }
+        case .vertical:
+            return patternFromRule { x, _ in x % 2 == 0 }
+        case .cross:
+            return patternFromRule { x, y in x % 2 == 0 || y % 2 == 0 }
+        case .diagDown:
+            return patternFromRule { x, y in ((x - y) % 4 + 4) % 4 == 0 }
+        case .diagUp:
+            return patternFromRule { x, y in (x + y) % 4 == 0 }
+        case .diagCross:
+            return patternFromRule { x, y in ((((x - y) % 4 + 4) % 4) == 0) || ((x + y) % 4 == 0) }
+        }
+    }
+
+    private func patternFromRule(_ rule: (Int, Int) -> Bool) -> [[Bool]] {
+        var out = Array(repeating: Array(repeating: false, count: 8), count: 8)
+        for y in 0..<8 {
+            for x in 0..<8 {
+                out[y][x] = rule(x, y)
+            }
+        }
+        return out
+    }
+
+    private func paintStroke(_ g: CGContext, path: CGPath, style: OutlineStyle, width: CGFloat, color: RGB) {
+        g.saveGState()
+        g.setStrokeColor(color.cgColor)
+        switch style {
+        case .none:
+            break
+        case .solid:
+            g.setAlpha(1)
+            g.setLineWidth(width)
             g.addPath(path)
             g.strokePath()
         }
@@ -423,6 +564,39 @@ final class DocumentNSView: NSView {
         g.addPath(p)
         g.strokePath()
         g.restoreGState()
+    }
+
+    private func drawRulerGuides(_ g: CGContext, _ m: PaintModel) {
+        g.saveGState()
+        g.setStrokeColor(CGColor(gray: 0.8, alpha: 0.18))
+        g.setLineWidth(1 / zoom)
+        let major = rulerMajorStep(for: m.zoom)
+        let p = CGMutablePath()
+
+        var x = major
+        while x < CGFloat(m.docWidth) {
+            p.move(to: CGPoint(x: x, y: 0))
+            p.addLine(to: CGPoint(x: x, y: CGFloat(m.docHeight)))
+            x += major
+        }
+
+        var y = major
+        while y < CGFloat(m.docHeight) {
+            p.move(to: CGPoint(x: 0, y: y))
+            p.addLine(to: CGPoint(x: CGFloat(m.docWidth), y: y))
+            y += major
+        }
+
+        g.addPath(p)
+        g.strokePath()
+        g.restoreGState()
+    }
+
+    private func rulerMajorStep(for zoom: CGFloat) -> CGFloat {
+        for c in [1.0, 2, 5, 10, 20, 50, 100, 200, 500, 1000] where CGFloat(c) * zoom >= 40 {
+            return CGFloat(c)
+        }
+        return 1000
     }
 
     private func drawEraserRing(_ g: CGContext, _ m: PaintModel) {
@@ -583,7 +757,14 @@ final class DocumentNSView: NSView {
 
         switch m.tool {
         case .text:
-            startTextEditor(at: p)
+            drag = DragState(
+                mode: .textBox,
+                rightButton: right,
+                start: p,
+                last: p,
+                rect: CGRect(x: p.x, y: p.y, width: 1, height: 1)
+            )
+            needsDisplay = true
             return
         case .picker:
             if let c = m.pickColor(at: p) { m.setColor(well: right ? 2 : 1, c) }
@@ -594,6 +775,13 @@ final class DocumentNSView: NSView {
             return
         case .magnifier:
             m.zoomStep(right ? -1 : 1, focusDocPoint: p)
+            return
+        case .move:
+            var d = DragState(mode: .layerMove, rightButton: right, start: p, last: p)
+            d.layerMoveBase = m.activeLayer.image()
+            d.layerMoveDelta = .zero
+            drag = d
+            needsDisplay = true
             return
         case .sticker:
             m.stampSticker(at: p)
@@ -625,6 +813,8 @@ final class DocumentNSView: NSView {
             eraseSegment(from: p, to: p)
         case .shape:
             d.mode = m.shapeId == "line" ? .line : .shape
+        case .move:
+            d.mode = .layerMove
         case .select:
             let hi = hitSelHandle(p)
             if hi >= 0 {
@@ -663,6 +853,10 @@ final class DocumentNSView: NSView {
         switch d.mode {
         case .stroke:
             if m.tool == .brush && m.brushType == .airbrush {
+                if let sl = d.strokeLayer {
+                    let color = d.rightButton ? m.color2 : m.color1
+                    BrushEngine.spraySegment(sl.ctx, from: d.last, to: p, size: m.currentSize, color: color)
+                }
                 d.last = p
             } else if let sl = d.strokeLayer {
                 let color = d.rightButton ? m.color2 : m.color1
@@ -675,9 +869,16 @@ final class DocumentNSView: NSView {
         case .line:
             d.end = p
             m.selectionText = "\(Int(abs(p.x - d.start.x))) × \(Int(abs(p.y - d.start.y)))px"
+        case .textBox:
+            d.rect = normRect(d.start, p, square: false)
+            if let r = d.rect {
+                m.selectionText = "\(Int(r.width)) × \(Int(r.height))px"
+            }
         case .shape:
             d.rect = normRect(d.start, p, square: d.shiftDown)
             if let r = d.rect { m.selectionText = "\(Int(r.width)) × \(Int(r.height))px" }
+        case .layerMove:
+            d.layerMoveDelta = CGPoint(x: (p.x - d.start.x).rounded(), y: (p.y - d.start.y).rounded())
         case .curve:
             if var st = curveState {
                 switch st.phase {
@@ -755,6 +956,14 @@ final class DocumentNSView: NSView {
                 m.commit()
             }
             m.selectionText = m.selection.map { "\(Int($0.rect.width)) × \(Int($0.rect.height))px" } ?? ""
+        case .textBox:
+            let rect = d.rect ?? CGRect(x: p.x, y: p.y, width: 0, height: 0)
+            if rect.width >= 3 || rect.height >= 3 {
+                startTextEditor(at: rect.origin, initialBoxSize: rect.size)
+            } else {
+                startTextEditor(at: p)
+            }
+            m.selectionText = ""
         case .shape:
             if let r = d.rect, r.width > 2 || r.height > 2 {
                 let shape = ShapeLibrary.byId(m.shapeId)
@@ -762,6 +971,15 @@ final class DocumentNSView: NSView {
                 m.commit()
             }
             m.selectionText = ""
+        case .layerMove:
+            if let base = d.layerMoveBase {
+                applyLayerMove(baseImage: base, delta: d.layerMoveDelta)
+                if d.layerMoveDelta != .zero {
+                    m.commit()
+                } else {
+                    m.repaint()
+                }
+            }
         case .curve:
             if var st = curveState {
                 switch st.phase {
@@ -877,17 +1095,47 @@ final class DocumentNSView: NSView {
         m.repaint()
     }
 
+    private func applyLayerMove(baseImage: CGImage, delta: CGPoint) {
+        guard let m = model else { return }
+        let layer = m.activeLayer
+        let ctx = layer.ctx
+        let rect = CGRect(x: 0, y: 0, width: m.docWidth, height: m.docHeight)
+        ctx.saveGState()
+        if layer.isBackground {
+            ctx.setBlendMode(.normal)
+            ctx.setFillColor(CGColor(srgbRed: 1, green: 1, blue: 1, alpha: 1))
+            ctx.fill(rect)
+        } else {
+            ctx.setBlendMode(.clear)
+            ctx.fill(rect)
+            ctx.setBlendMode(.normal)
+        }
+        drawImageTopLeft(
+            ctx,
+            baseImage,
+            in: CGRect(
+                x: delta.x,
+                y: delta.y,
+                width: CGFloat(m.docWidth),
+                height: CGFloat(m.docHeight)
+            )
+        )
+        ctx.restoreGState()
+    }
+
     private func startAirbrush(d: inout DragState, color: RGB) {
         guard let m = model, let sl = d.strokeLayer else { return }
         BrushEngine.sprayAt(sl.ctx, d.start, size: m.currentSize, color: color)
         airTimer?.invalidate()
-        airTimer = Timer.scheduledTimer(withTimeInterval: 0.03, repeats: true) { [weak self] _ in
+        let timer = Timer(timeInterval: 0.03, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 guard let self, let m = self.model, let d = self.drag, let sl = d.strokeLayer else { return }
                 BrushEngine.sprayAt(sl.ctx, d.last, size: m.currentSize, color: d.rightButton ? m.color2 : m.color1)
                 self.needsDisplay = true
             }
         }
+        airTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
     }
 
     private func stopAirbrush() {
@@ -905,6 +1153,7 @@ final class DocumentNSView: NSView {
         updateCursor(viewPt, rawDoc)
         guard let m = model else { return }
         if m.tool == .eraser { needsDisplay = true }
+        if m.tool == .sticker { needsDisplay = true }
         if m.tool == .shape && (m.shapeId == "curve" || m.shapeId == "polygon") {
             if var st = curveState, st.phase > 0 {
                 if st.phase == 1 { st.c1 = clampDoc(rawDoc) } else { st.c2 = clampDoc(rawDoc) }
@@ -919,6 +1168,7 @@ final class DocumentNSView: NSView {
         hoverDoc = nil
         model?.cursorText = ""
         if model?.tool == .eraser { needsDisplay = true }
+        if model?.tool == .sticker { needsDisplay = true }
     }
 
     private func updateCursorStatus(_ rawDoc: CGPoint) {
@@ -943,6 +1193,12 @@ final class DocumentNSView: NSView {
         guard canvasRectInView.contains(viewPt) else { NSCursor.arrow.set(); return }
         switch m.tool {
         case .text: NSCursor.iBeam.set()
+        case .move:
+            if drag?.mode == .layerMove {
+                NSCursor.closedHand.set()
+            } else {
+                NSCursor.openHand.set()
+            }
         case .select:
             let hi = hitSelHandle(docPt)
             if hi >= 0 {
@@ -963,7 +1219,7 @@ final class DocumentNSView: NSView {
 
     // MARK: text editor overlay
 
-    private func startTextEditor(at p: CGPoint) {
+    private func startTextEditor(at p: CGPoint, initialBoxSize: CGSize? = nil) {
         guard let m = model else { return }
         commitActiveText()
         let tv = PaintTextView(frame: .zero)
@@ -973,6 +1229,7 @@ final class DocumentNSView: NSView {
         tv.allowsUndo = true
         tv.onEscape = { [weak self] in self?.cancelActiveText() }
         textOrigin = p
+        textBoxSizeDoc = initialBoxSize
         textView = tv
         addSubview(tv)
         m.textEditing = true
@@ -1007,15 +1264,19 @@ final class DocumentNSView: NSView {
         let origin = viewPoint(fromDoc: textOrigin)
         let text = tv.string.isEmpty ? "M" : tv.string
         let attrs = m.textStyle.attributes(color: m.color1.nsColor)
-        let lines = text.components(separatedBy: "\n")
-        var w: CGFloat = 80
-        for ln in lines {
-            let s = NSAttributedString(string: ln.isEmpty ? "M" : ln, attributes: attrs)
-            w = max(w, s.size().width + 16)
-        }
-        let lineH = m.textStyle.size * 1.35
-        let h = max(1, CGFloat(lines.count)) * lineH + 10
-        tv.frame = CGRect(x: origin.x, y: origin.y, width: min(w, CGFloat(m.docWidth) - textOrigin.x) * zoom, height: h * zoom)
+        let maxW = max(24, CGFloat(m.docWidth) - textOrigin.x)
+        let requestedW = max(24, textBoxSizeDoc?.width ?? 160)
+        let w = min(requestedW, maxW)
+        let attr = NSAttributedString(string: text, attributes: attrs)
+        let bounds = attr.boundingRect(
+            with: NSSize(width: max(12, w - 8), height: .greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading]
+        )
+        let baseH = max(m.textStyle.size * 1.6, bounds.height + 10)
+        let requestedH = textBoxSizeDoc?.height ?? 0
+        let h = max(baseH, requestedH)
+        let maxH = max(20, CGFloat(m.docHeight) - textOrigin.y)
+        tv.frame = CGRect(x: origin.x, y: origin.y, width: w * zoom, height: min(h, maxH) * zoom)
     }
 
     func hasActiveText() -> Bool { textView != nil }
@@ -1027,6 +1288,7 @@ final class DocumentNSView: NSView {
         let boxW = tv.frame.width / zoom
         tv.removeFromSuperview()
         textView = nil
+        textBoxSizeDoc = nil
         m.textEditing = false
         if !text.isEmpty {
             m.rasterizeText(text, at: textOrigin, boxWidth: boxW)
@@ -1039,6 +1301,7 @@ final class DocumentNSView: NSView {
         NotificationCenter.default.removeObserver(self, name: NSText.didChangeNotification, object: tv)
         tv.removeFromSuperview()
         textView = nil
+        textBoxSizeDoc = nil
         model?.textEditing = false
         model?.repaint()
     }
@@ -1137,11 +1400,7 @@ final class PaintRulerView: NSRulerView {
         g.fill(bounds)
 
         let zoom = m.zoom
-        var step: CGFloat = 1000
-        for c in [1.0, 2, 5, 10, 20, 50, 100, 200, 500, 1000] where CGFloat(c) * zoom >= 40 {
-            step = CGFloat(c)
-            break
-        }
+        let step = rulerMajorStep(for: zoom)
         let minor = step / 5
 
         let isH = orientation == .horizontalRuler
@@ -1193,12 +1452,19 @@ final class PaintRulerView: NSRulerView {
             v += minor
         }
     }
+
+    private func rulerMajorStep(for zoom: CGFloat) -> CGFloat {
+        for c in [1.0, 2, 5, 10, 20, 50, 100, 200, 500, 1000] where CGFloat(c) * zoom >= 40 {
+            return CGFloat(c)
+        }
+        return 1000
+    }
 }
 
 // MARK: - SwiftUI wrapper
 
 struct CanvasArea: NSViewRepresentable {
-    let model: PaintModel
+    @ObservedObject var model: PaintModel
 
     func makeNSView(context: Context) -> NSScrollView {
         let scroll = NSScrollView()
@@ -1216,14 +1482,16 @@ struct CanvasArea: NSViewRepresentable {
         let hRuler = PaintRulerView(scrollView: scroll, orientation: .horizontalRuler)
         hRuler.model = model
         hRuler.ruleThickness = 20
+        hRuler.clientView = doc
         let vRuler = PaintRulerView(scrollView: scroll, orientation: .verticalRuler)
         vRuler.model = model
         vRuler.ruleThickness = 20
+        vRuler.clientView = doc
         scroll.horizontalRulerView = hRuler
         scroll.verticalRulerView = vRuler
-        scroll.rulersVisible = false
-        scroll.hasHorizontalRuler = true
-        scroll.hasVerticalRuler = true
+        scroll.rulersVisible = model.rulersOn
+        scroll.hasHorizontalRuler = model.rulersOn
+        scroll.hasVerticalRuler = model.rulersOn
 
         NotificationCenter.default.addObserver(
             forName: NSView.frameDidChangeNotification, object: scroll.contentView, queue: .main
@@ -1231,6 +1499,15 @@ struct CanvasArea: NSViewRepresentable {
             Task { @MainActor in doc?.updateDocumentFrame() }
         }
         scroll.contentView.postsFrameChangedNotifications = true
+        scroll.contentView.postsBoundsChangedNotifications = true
+
+        NotificationCenter.default.addObserver(
+            forName: NSView.boundsDidChangeNotification, object: scroll.contentView, queue: .main
+        ) { [weak scroll] _ in
+            guard let scroll else { return }
+            (scroll.horizontalRulerView as? PaintRulerView)?.needsDisplay = true
+            (scroll.verticalRulerView as? PaintRulerView)?.needsDisplay = true
+        }
 
         DispatchQueue.main.async {
             doc.updateDocumentFrame()
@@ -1239,6 +1516,8 @@ struct CanvasArea: NSViewRepresentable {
     }
 
     func updateNSView(_ scroll: NSScrollView, context: Context) {
+        scroll.hasHorizontalRuler = model.rulersOn
+        scroll.hasVerticalRuler = model.rulersOn
         scroll.rulersVisible = model.rulersOn
         (scroll.horizontalRulerView as? PaintRulerView)?.needsDisplay = true
         (scroll.verticalRulerView as? PaintRulerView)?.needsDisplay = true
